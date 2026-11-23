@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# PanicOS boot menu: one table for both bootloaders (GRUB on UEFI, syslinux
+# on BIOS), turned into their menus by scripts/gen-boot-menu.
+#
+# TAB-separated:
+#
+#   id <TAB> title <TAB> extra kernel parameters (optional)
+#
+# The first row is the default entry. Every entry gets the common parameters
+# from live/auto/config; the third column is added after them.
+
+live	PanicOS
+ram	PanicOS to RAM, no persistence (the stick can then be removed)	toram nopersistence
+console	PanicOS, text console only	live-config.nox11autologin

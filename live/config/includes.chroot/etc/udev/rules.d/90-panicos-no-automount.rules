@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# PanicOS: nothing on a disk is mounted unless the operator mounts it.
+#
+# The image ships no automounter. This is the second guard: if udisks2 is
+# ever installed on a persistent stick (gvfs and most file managers pull it
+# in), it must still not mount filesystems on its own.
+SUBSYSTEM=="block", ENV{UDISKS_AUTO}="0"

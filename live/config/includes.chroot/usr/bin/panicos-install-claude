@@ -1,0 +1,56 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# panicos-install-claude — download and install Claude Code.
+#
+# usage: panicos-install-claude
+#
+# Claude Code is Anthropic's proprietary software. PanicOS does not include
+# it; this fetches it from Anthropic's own apt archive, which the image is
+# already set up to trust for that one package source. By installing it you
+# accept Anthropic's terms, and you use it with your own account.
+#
+# Pre:    a network connection. Root is obtained through sudo if needed.
+# Post:   the `claude` command is installed. On a persistent stick it stays.
+# Emits:  apt's progress, on stderr, when stderr is a terminal; otherwise
+#         nothing unless it fails.
+# Exit:   0 installed (or already there); 1 failed, with the reason on stderr.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly LIB_DIR="$SCRIPT_DIR/../lib/panicos"
+readonly PROGRAM=panicos-install-claude
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+source "$LIB_DIR/constants.sh"
+
+[[ $EUID -eq 0 ]] || exec sudo -- "$0" "$@"
+
+# apt COMMAND... -> runs apt-get; shows its output only on a terminal or on
+# failure.
+apt() {
+  local output
+  if [[ -t 2 ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get "$@" >&2
+  elif ! output="$(DEBIAN_FRONTEND=noninteractive apt-get "$@" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 1
+}
+
+# Refresh Anthropic's archive only: quicker, and it cannot fail because some
+# unrelated mirror is unreachable.
+apt update \
+  --option Dir::Etc::sourcelist="$PANICOS_CLAUDE_SOURCES" \
+  --option Dir::Etc::sourceparts=- \
+  --option APT::Get::List-Cleanup=0 \
+  || fail "cannot reach Anthropic's package archive. Is the network up? (nmtui)"
+
+apt install --yes "$PANICOS_CLAUDE_PACKAGE" \
+  || fail "installing $PANICOS_CLAUDE_PACKAGE failed"

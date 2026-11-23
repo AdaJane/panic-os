@@ -1,0 +1,167 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# panicos-persist — add a persistence volume to a stick holding a PanicOS image.
+#
+# usage: panicos-persist [--no-encrypt] DEVICE
+#
+# Pre:    Run as root. DEVICE is a whole disk that was written from a PanicOS
+#         ISO, has no persistence volume yet, has nothing mounted, and has at
+#         least 1 GiB free after the image. Anything else is refused, with
+#         every objection listed, before a byte is written.
+# Post:   DEVICE has one more partition, filling the free space. It holds an
+#         ext4 filesystem with PanicOS's persistence label and a
+#         persistence.conf of "/ union" — inside a LUKS2 container unless
+#         --no-encrypt was given. The only other change to DEVICE is the new
+#         partition table entry.
+# Passphrase (when encrypting): asked for twice on the terminal. If stdin is
+#         not a terminal, the first line of stdin is the passphrase.
+# Emits:  nothing on success.
+# Exit:   0 done; 1 refused or failed (reason on stderr); 64 usage error.
+#
+# The same file runs on the build host (via panicos-flash or `make persist`)
+# and in the image.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly LIB_DIR="$SCRIPT_DIR/../lib/panicos"
+readonly PROGRAM=panicos-persist
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+source "$LIB_DIR/constants.sh"
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/device.sh
+source "$LIB_DIR/device.sh"
+
+readonly EX_USAGE=64
+readonly MBR_TYPE_LINUX=83
+# live-boot: make the whole root filesystem persistent through an overlay.
+readonly PERSISTENCE_CONF='/ union'
+readonly MAPPER_NAME=panicos-persist-setup
+
+usage() {
+  printf 'usage: %s [--no-encrypt] DEVICE\n' "$PROGRAM" >&2
+  exit "$EX_USAGE"
+}
+
+# identity_objections DEVICE -> one line per reason DEVICE is the wrong target.
+identity_objections() {
+  local -r device=$1
+  device_facts "$device" \
+    | device_jq \
+      --arg iso_label "$PANICOS_ISO_LABEL" \
+      --argjson persistence_labels \
+      "[\"$PANICOS_PERSISTENCE_LABEL\", \"$PANICOS_LUKS_LABEL\"]" \
+      'include "device"; persist_objections($iso_label; $persistence_labels)[]'
+}
+
+# space_objections DEVICE -> one line per reason the volume does not fit.
+space_objections() {
+  local -r device=$1
+  sfdisk --json "$device" \
+    | device_jq \
+      --argjson disk_bytes "$(blockdev --getsize64 "$device")" \
+      --argjson min_persistence_bytes "$PANICOS_MIN_PERSISTENCE_BYTES" \
+      'include "device"; space_objections($disk_bytes; $min_persistence_bytes)[]'
+}
+
+# read_passphrase -> the passphrase on stdout.
+read_passphrase() {
+  local passphrase confirmation
+  if [[ -t 0 ]]; then
+    read -rs -p 'Passphrase for the persistence volume: ' passphrase
+    printf '\n' >&2
+    read -rs -p 'Repeat the passphrase: ' confirmation
+    printf '\n' >&2
+    [[ $passphrase == "$confirmation" ]] || die 'the passphrases do not match'
+  else
+    IFS= read -r passphrase || true
+  fi
+  [[ -n $passphrase ]] || die 'the passphrase is empty'
+  printf '%s' "$passphrase"
+}
+
+# append_partition DEVICE -> creates the partition and prints its device node.
+append_partition() {
+  local -r device=$1
+  local start_sector node
+  start_sector="$(sfdisk --json "$device" \
+    | device_jq 'include "device"; append_start_sector')"
+  # --wipe never: the ISO 9660 signature at the start of DEVICE must survive.
+  quietly sfdisk --append --wipe never "$device" \
+    <<< "start=$start_sector, type=$MBR_TYPE_LINUX"
+  node="$(sfdisk --json "$device" | device_jq --argjson start "$start_sector" \
+    '.partitiontable.partitions[] | select(.start == $start) | .node')"
+  readonly start_sector node
+  wait_for_block_device "$node"
+  printf '%s\n' "$node"
+}
+
+# make_filesystem VOLUME -> ext4 with the persistence label and persistence.conf.
+make_filesystem() {
+  local -r volume=$1
+  local seed_dir
+  seed_dir="$(mktemp -d)"
+  readonly seed_dir
+  chmod 0755 "$seed_dir"
+  printf '%s\n' "$PERSISTENCE_CONF" > "$seed_dir/persistence.conf"
+  # -d populates the new filesystem from seed_dir, so nothing is ever mounted.
+  quietly mkfs.ext4 -q -F -L "$PANICOS_PERSISTENCE_LABEL" -d "$seed_dir" "$volume"
+  rm -rf "$seed_dir"
+}
+
+make_encrypted_filesystem() {
+  local -r partition=$1 passphrase=$2
+  # printf, not a here-string: --key-file=- takes stdin verbatim, and a
+  # here-string's trailing newline would become part of the key, which no
+  # one could then type at the boot prompt.
+  printf '%s' "$passphrase" | quietly cryptsetup luksFormat --batch-mode \
+    --type luks2 --label "$PANICOS_LUKS_LABEL" --key-file=- "$partition"
+  printf '%s' "$passphrase" \
+    | quietly cryptsetup open --key-file=- "$partition" "$MAPPER_NAME"
+  trap 'cryptsetup close "$MAPPER_NAME"' EXIT
+  make_filesystem "/dev/mapper/$MAPPER_NAME"
+  trap - EXIT
+  quietly cryptsetup close "$MAPPER_NAME"
+}
+
+main() {
+  local encrypt=true
+  while [[ ${1:-} == -* ]]; do
+    case $1 in
+      --no-encrypt) encrypt=false ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  readonly encrypt
+  [[ $# -eq 1 ]] || usage
+  local -r device=$1
+
+  [[ $EUID -eq 0 ]] || die 'must be run as root'
+  [[ -b $device ]] || die "$device is not a block device"
+  refuse_if "$device" "$(identity_objections "$device")"
+  refuse_if "$device" "$(in_use_objection "$device")"
+  refuse_if "$device" "$(space_objections "$device")"
+
+  # Ask before touching the disk, so a mistyped passphrase changes nothing.
+  local passphrase=''
+  if [[ $encrypt == true ]]; then
+    passphrase="$(read_passphrase)"
+  fi
+  readonly passphrase
+
+  local partition
+  partition="$(append_partition "$device")"
+  readonly partition
+  # A stick that was flashed before may still hold an old volume here.
+  quietly wipefs --all "$partition"
+  if [[ $encrypt == true ]]; then
+    make_encrypted_filesystem "$partition" "$passphrase"
+  else
+    make_filesystem "$partition"
+  fi
+  sync
+}
+
+main "$@"

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+#
+# Mozilla's official apt archive: current Firefox, as built by Mozilla.
+# Debian itself carries only the extended-support release.
+#
+# Trusted for this archive only, through the key named here. The key is
+# copied from live/keyrings/ and pinned in tests/unit/archives.bats.
+deb [signed-by=/etc/apt/keyrings/mozilla.asc] https://packages.mozilla.org/apt mozilla main

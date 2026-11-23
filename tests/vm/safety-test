@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# safety-test — prove that booting PanicOS leaves a client's disk exactly as
+# it found it.
+#
+# usage: safety-test ISO
+#
+# Runs as root inside the build container, privileged and with the host's
+# /dev (loop devices), see Makefile, `make test-vm`.
+#
+# The test builds a disk standing in for the machine being recovered, with
+# the things a careless boot would touch:
+#
+#   1  an ext4 filesystem that was not unmounted cleanly. Mounting it, even
+#      read-only, replays its journal and so writes to the disk.
+#   2  a swap partition, which must not be activated.
+#   3  a volume labelled "persistence" with a persistence.conf: some other
+#      live system's persistence, which must not be adopted.
+#
+# It then boots PanicOS with that disk attached as an internal SATA disk, and
+# the stick presenting as a fixed disk, as USB SSDs do. That combination is
+# the one in which stock live-boot searches internal disks first. The client
+# disk's checksum must be the same after the boot as before it, and the guest
+# must report no swap, no foreign mounts and no assembled volumes.
+#
+# Not covered here: RAID members and LVM volume groups on the client disk.
+# Creating those would assemble them on the host that runs the test.
+#
+# Emits:  one TAP line per check on stdout; diagnostics on stderr.
+# Exit:   0 if every check passed, 1 otherwise.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+# shellcheck source=tests/vm/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+readonly CLIENT_DISK_BYTES=$((1024 * 1024 * 1024))
+# sfdisk script: three MBR partitions (size, type).
+readonly CLIENT_PARTITIONS=$',256M,83\n,128M,82\n,128M,83\n'
+readonly EXT4_PARTITION=p1 SWAP_PARTITION=p2 FOREIGN_PERSISTENCE_PARTITION=p3
+# live-boot's default label, which PanicOS must ignore.
+readonly FOREIGN_PERSISTENCE_LABEL=persistence
+readonly UNCLEAN_FLAG=needs_recovery
+
+# attach IMAGE -> its loop device, recorded for cleanup.
+attach() {
+  losetup --find --show --partscan "$1" | tee --append "$WORK_DIR/loops"
+}
+
+detach_all_attached() {
+  local loop
+  while read -r loop; do
+    losetup --detach "$loop" 2> /dev/null || true
+  done < "$WORK_DIR/loops"
+}
+
+checksum() { sha256sum < "$1"; }
+
+# ext4_is_unclean IMAGE -> succeeds if the first partition needs journal recovery.
+ext4_is_unclean() {
+  local -r image=$1
+  local loop status=0
+  loop="$(attach "$image")"
+  dumpe2fs -h "$loop$EXT4_PARTITION" 2> /dev/null \
+    | grep --quiet "^Filesystem features:.*$UNCLEAN_FLAG" || status=$?
+  losetup --detach "$loop"
+  return "$status"
+}
+
+# make_client_disk IMAGE -> IMAGE is the client disk described above.
+make_client_disk() {
+  local -r image=$1
+  local -r staging="$WORK_DIR/client-staging.img" mount_dir="$WORK_DIR/client-mnt"
+  local -r seed_dir="$WORK_DIR/foreign-persistence-seed"
+  local loop
+
+  truncate --size="$CLIENT_DISK_BYTES" "$staging"
+  sfdisk --quiet --label dos "$staging" <<< "$CLIENT_PARTITIONS"
+  loop="$(attach "$staging")"
+  mkfs.ext4 -q -L client-data "$loop$EXT4_PARTITION"
+  mkswap --label client-swap "$loop$SWAP_PARTITION" > /dev/null
+  mkdir -p "$seed_dir"
+  printf '/ union\n' > "$seed_dir/persistence.conf"
+  mkfs.ext4 -q -L "$FOREIGN_PERSISTENCE_LABEL" -d "$seed_dir" \
+    "$loop$FOREIGN_PERSISTENCE_PARTITION"
+
+  # Copy the disk while its filesystem is mounted read-write: the copy is a
+  # filesystem whose machine lost power.
+  mkdir -p "$mount_dir"
+  mount "$loop$EXT4_PARTITION" "$mount_dir"
+  printf 'client data\n' > "$mount_dir/important.txt"
+  sync
+  cp --sparse=always "$staging" "$image"
+  umount "$mount_dir"
+  losetup --detach "$loop"
+  rm -f "$staging"
+}
+
+# run_scenario ISO CLIENT_DISK NAME FIRMWARE SECUREBOOT CODE VARS -> TAP lines.
+run_scenario() {
+  local -r iso=$1 pristine_client=$2 name=$3 firmware=$4 secureboot=$5 code=$6 vars=$7
+  local -r client="$WORK_DIR/$name.client.img"
+  local -r serial_log="$WORK_DIR/$name.serial.log"
+  cp --sparse=always "$pristine_client" "$client"
+  local -r before="$(checksum "$client")"
+  local -a machine
+  mapfile -t machine < <(
+    usb_stick_args "$iso" "$READ_ONLY" "$FIXED"
+    internal_disk_args "$client"
+    firmware_args "$code" "$vars" "$secureboot" "$WORK_DIR/$name.vars.fd"
+  )
+  readonly machine
+
+  local booted=0 unchanged=0 failed=0
+  {
+    boot "$serial_log" "${machine[@]}" && serial_has "$serial_log" \
+      "$PANICOS_MARK_BOOT firmware=$firmware secureboot=$secureboot" \
+      "$PANICOS_MARK_PERSISTENCE state=$PANICOS_PERSISTENCE_MISSING boots=1" \
+      "$PANICOS_MARK_SAFETY swaps=0 foreign_mounts=0 md_arrays=0 dm_devices=0" \
+      "$PANICOS_MARK_PASS"
+  } || booted=$?
+  report "boots from a fixed-disk stick and touches nothing ($name)" \
+    "$booted" "$serial_log" || failed=1
+
+  [[ "$(checksum "$client")" == "$before" ]] || unchanged=$?
+  report "the client disk is bit-for-bit unchanged ($name)" "$unchanged" || failed=1
+  rm -f "$client"
+  return "$failed"
+}
+
+main() {
+  [[ $# -eq 1 ]] || {
+    printf 'usage: safety-test ISO\n' >&2
+    exit "$EX_USAGE"
+  }
+  local -r iso=$1
+  require_iso_and_kvm "$iso"
+
+  WORK_DIR="$(mktemp -d)"
+  readonly WORK_DIR
+  : > "$WORK_DIR/loops"
+  trap 'detach_all_attached; rm -rf "$WORK_DIR"' EXIT
+
+  local -r client="$WORK_DIR/client.img"
+  local fixture=0 failed=0
+  { make_client_disk "$client" && ext4_is_unclean "$client"; } || fixture=$?
+  # Without an unclean filesystem the checksum comparison would prove little.
+  report 'fixture: the client disk has an unclean ext4 filesystem' "$fixture" || exit 1
+
+  for_each_scenario run_scenario "$iso" "$client" || failed=1
+  exit "$failed"
+}
+
+main "$@"

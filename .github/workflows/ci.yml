@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: MIT
+#
+# Checks every change and builds the ISO.
+#
+#   check    shellcheck and the bats unit tests
+#   build    the ISO itself, uploaded as a workflow artifact for 7 days
+#   release  on a tag v*, attaches that ISO to a GitHub Release
+#
+# The build proves the image can be built: the manifest is valid, every
+# package installs, every build hook passes, and the ISO is within its size
+# budget. It does NOT boot the image. The VM tests (make test-vm) need KVM
+# and privileged loop devices and are run locally before a release is tagged.
+#
+# Third-party actions are pinned to a commit, with the release it is in the
+# comment beside it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARTIFACT_NAME: panicos-iso
+  ARTIFACT_RETENTION_DAYS: 7
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint and unit tests
+        run: make lint test-unit
+
+  build:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        # The build needs about 10 GB; the runner image ships toolchains
+        # PanicOS has no use for.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df --human-readable /
+      - name: Build the ISO
+        run: make iso
+      - name: Verify the checksum file
+        working-directory: out
+        run: sha256sum --check ./*.sha256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/
+          if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          # The ISO is already compressed.
+          compression-level: 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PanicOS $GITHUB_REF_NAME" \
+            --notes-file - << 'END'
+          Built by CI from this tag.
+
+          **CI builds the image but does not boot it.** Before relying on a
+          stick made from it, boot it once on a machine that does not matter.
+
+          - Check the download: `sha256sum --check panicos-*.iso.sha256`
+          - The `.packages` file lists every Debian package in the image with
+            its exact version. Source for each is available from Debian
+            (https://snapshot.debian.org).
+          - Claude Code is not included; the stick offers to download it from
+            Anthropic on first startup.
+
+          PanicOS comes with no warranty. See the README.
+          END

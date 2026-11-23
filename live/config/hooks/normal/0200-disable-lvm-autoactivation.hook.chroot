@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Stop LVM from activating volume groups as their disks appear.
+#
+# Debian's udev rules run `vgchange -aay` for every complete volume group
+# they see. On a machine being recovered that would activate a client's
+# volumes, which for RAID, cache and thin volumes means writing to them. An
+# empty auto_activation_volume_list means "autoactivate nothing"; the
+# operator activates what they need, for example read-only:
+#
+#   vgchange --activate y --readonly VG
+
+set -eu
+
+readonly LVM_CONF=/etc/lvm/lvm.conf
+readonly SETTING='auto_activation_volume_list = []'
+
+sed --in-place "/^activation {/a\\	${SETTING}" "${LVM_CONF}"
+
+# Fail the build unless LVM itself now reads the setting back.
+[ "$(lvmconfig activation/auto_activation_volume_list)" = 'auto_activation_volume_list=[]' ]

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# gen-boot-menu — derive a bootloader menu from the boot-entry table.
+#
+# usage: gen-boot-menu grub|syslinux
+#
+# Reads:  the boot-entry table on stdin (format: see boot-menu.awk)
+# Emits:  the menu for the named bootloader on stdout. For grub that is the
+#         generated entries followed by grub-utilities.cfg.
+# Fails:  exit 64 for an unknown format; exit 65, with nothing on stdout, if
+#         the table is malformed
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly EX_USAGE=64
+readonly FORMAT_GRUB=grub
+readonly FORMAT_SYSLINUX=syslinux
+readonly GRUB_UTILITIES="$SCRIPT_DIR/grub-utilities.cfg"
+
+case ${1:-} in
+  "$FORMAT_GRUB" | "$FORMAT_SYSLINUX") ;;
+  *)
+    printf 'usage: gen-boot-menu %s|%s\n' "$FORMAT_GRUB" "$FORMAT_SYSLINUX" >&2
+    exit "$EX_USAGE"
+    ;;
+esac
+readonly format=$1
+
+# Generate fully before emitting anything, so that a malformed table yields
+# no output at all rather than half a menu.
+entries="$(awk -v format="$format" -f "$SCRIPT_DIR/boot-menu.awk")"
+readonly entries
+
+printf '%s\n' "$entries"
+if [[ $format == "$FORMAT_GRUB" ]]; then
+  # Without its licence header: comments in the generated file would only
+  # say what this script's source already says.
+  grep --invert-match '^#' "$GRUB_UTILITIES"
+fi

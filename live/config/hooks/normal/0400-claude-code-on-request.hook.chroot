@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Claude Code must be absent from the image and one command away.
+#
+# It is Anthropic's proprietary software: an image that contains it may not
+# be passed on. PanicOS instead offers to download it on first startup
+# (panicos-claude-offer, panicos-install-claude). Both halves are checked
+# here, so that neither can break unnoticed:
+#
+#   - the package is not installed, whatever some dependency might pull in;
+#   - apt can see it in Anthropic's archive, so the archive, its key and the
+#     signed-by link between them all work.
+
+set -eu
+
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+. /usr/lib/panicos/constants.sh
+
+if dpkg-query --show "${PANICOS_CLAUDE_PACKAGE}" > /dev/null 2>&1; then
+	echo "${PANICOS_CLAUDE_PACKAGE} is installed in the image; it must not be" >&2
+	exit 1
+fi
+
+candidate="$(apt-cache policy "${PANICOS_CLAUDE_PACKAGE}" | awk '$1 == "Candidate:" { print $2 }')"
+case "${candidate}" in
+	'' | '(none)')
+		echo "apt has no candidate for ${PANICOS_CLAUDE_PACKAGE}; is Anthropic's archive reachable and its key valid?" >&2
+		exit 1
+		;;
+esac

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+#
+# Anthropic's official apt archive for Claude Code (stable channel).
+#
+# Claude Code is proprietary and is NOT installed in the image. The archive
+# is configured so that panicos-install-claude can fetch it on request, and
+# so that `apt upgrade` on a persistent stick keeps it current.
+#
+# Trusted for this archive only, through the key named here. The key is
+# copied from live/keyrings/ and pinned in tests/unit/archives.bats.
+deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main

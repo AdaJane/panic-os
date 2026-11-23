@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+// PanicOS: the live user already has passwordless root through sudo. Let
+// polkit agree, so that graphical tools which escalate through pkexec
+// (GParted) start without an authentication agent, which the image does not
+// ship. live-config's own polkit setup uses a file format polkit no longer
+// reads.
+polkit.addRule(function(action, subject) {
+    if (subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});

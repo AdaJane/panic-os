@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# persistence-test — prove that a flashed stick with a persistence volume
+# keeps state across reboots, and that panicos-persist refuses what it must.
+#
+# usage: persistence-test ISO
+#
+# Runs as root inside the build container, privileged and with the host's
+# /dev (loop devices), see Makefile, `make test-vm`.
+#
+# Part 1 exercises panicos-persist on loop-device "sticks" made from the ISO.
+# Part 2 boots a provisioned stick twice under every firmware scenario: the
+# guest appends to a file on each boot and reports the line count, which only
+# reaches 2 if the first boot's write was still there.
+#
+# Booting an encrypted stick needs a passphrase typed at the console, which
+# this harness cannot do; part 1 checks instead that the encrypted volume
+# opens with the passphrase exactly as an operator would type it.
+#
+# Emits:  one TAP line per check on stdout; diagnostics on stderr.
+# Exit:   0 if every check passed, 1 otherwise.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+# shellcheck source=tests/vm/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+readonly PERSIST="$IMAGE_ROOT/usr/bin/panicos-persist"
+readonly FLASH="$IMAGE_ROOT/usr/bin/panicos-flash"
+readonly STICK_SPARE_BYTES=$((2 * 1024 * 1024 * 1024))
+readonly SECTOR_BYTES=512
+readonly TEST_PASSPHRASE='correct horse battery'
+readonly TEST_MAPPER_NAME=panicos-persistence-test
+readonly MOUNT_TIMEOUT_SECONDS=10
+# The partition panicos-persist adds to an ISO, which already has two.
+readonly PERSISTENCE_PARTITION_SUFFIX=p3
+
+# new_stick ISO IMAGE -> IMAGE is the ISO as written to a larger stick.
+new_stick() {
+  local -r iso=$1 image=$2
+  cp "$iso" "$image"
+  truncate --size=$(($(stat --format=%s "$iso") + STICK_SPARE_BYTES)) "$image"
+}
+
+# attach IMAGE -> its loop device. Recorded so that cleanup can detach it even
+# if the test dies; never `losetup --detach-all`, these are the host's devices.
+attach() {
+  losetup --find --show --partscan "$1" | tee --append "$WORK_DIR/loops"
+}
+
+detach_all_attached() {
+  local loop
+  while read -r loop; do
+    losetup --detach "$loop" 2> /dev/null || true
+  done < "$WORK_DIR/loops"
+}
+
+creates_plain_volume_silently() {
+  local -r loop=$1
+  local output
+  output="$("$PERSIST" --no-encrypt "$loop" 2>&1)" && [[ -z $output ]]
+}
+
+creates_encrypted_volume() {
+  local -r loop=$1
+  printf '%s\n' "$TEST_PASSPHRASE" | "$PERSIST" "$loop"
+}
+
+# check NAME COMMAND... -> TAP line for whether COMMAND succeeded.
+check() {
+  local -r name=$1
+  shift
+  local status=0
+  "$@" > "$WORK_DIR/check.log" 2>&1 || status=$?
+  report "$name" "$status" "$WORK_DIR/check.log"
+}
+
+refuses() { ! "$@"; }
+
+# unverified_copy ISO -> path to the same image with no checksum file beside it.
+unverified_copy() {
+  local -r iso=$1 link="$WORK_DIR/unverified.iso"
+  ln --symbolic --force "$(readlink --canonicalize "$iso")" "$link"
+  printf '%s\n' "$link"
+}
+
+# flash_refuses_untouched ISO LOOP IMAGE REASON -> panicos-flash refuses to
+# write ISO to LOOP, says why, and leaves the backing IMAGE byte-identical.
+# Loop devices are never removable, so the happy path cannot be tested here;
+# it is a manual check on a real stick (see README).
+flash_refuses_untouched() {
+  local -r iso=$1 loop=$2 image=$3 reason=$4
+  local -r before="$(sha256sum < "$image")"
+  local output
+  output="$("$FLASH" --yes --no-encrypt "$iso" "$loop" 2>&1)" && return 1
+  [[ $output == *"$reason"* && "$(sha256sum < "$image")" == "$before" ]]
+}
+
+# image_area_unchanged ISO IMAGE -> succeeds if IMAGE still holds the ISO
+# byte for byte, apart from the partition table in sector 0.
+image_area_unchanged() {
+  local -r iso=$1 image=$2
+  local -r iso_bytes="$(stat --format=%s "$iso")"
+  cmp <(tail --bytes=+$((SECTOR_BYTES + 1)) "$iso") \
+    <(tail --bytes=+$((SECTOR_BYTES + 1)) "$image" | head --bytes=$((iso_bytes - SECTOR_BYTES)))
+}
+
+has_persistence_conf() {
+  local -r volume=$1
+  [[ "$(blkid --probe --match-tag LABEL --output value "$volume")" == "$PANICOS_PERSISTENCE_LABEL" ]] \
+    && [[ "$(debugfs -R 'cat /persistence.conf' "$volume" 2> /dev/null)" == '/ union' ]]
+}
+
+# opens_as_typed PARTITION -> the encrypted volume unlocks with the passphrase
+# entered the way a boot prompt takes it, and holds the persistence filesystem.
+opens_as_typed() {
+  local -r partition=$1
+  printf '%s\n' "$TEST_PASSPHRASE" | cryptsetup open "$partition" "$TEST_MAPPER_NAME"
+  local status=0
+  has_persistence_conf "/dev/mapper/$TEST_MAPPER_NAME" || status=$?
+  cryptsetup close "$TEST_MAPPER_NAME"
+  return "$status"
+}
+
+refused_while_mounted() {
+  local -r loop=$1
+  local -r mount_dir="$WORK_DIR/mnt"
+  mkdir -p "$mount_dir"
+  mount -o ro "${loop}p1" "$mount_dir"
+  local status=0
+  refuses "$PERSIST" --no-encrypt "$loop" || status=$?
+  umount "$mount_dir"
+  return "$status"
+}
+
+# A mount made in another mount namespace is invisible to lsblk here, exactly
+# as a mount on the host is invisible to a container that flashes a stick.
+# panicos-persist must still notice that the disk is in use.
+refused_while_mounted_elsewhere() {
+  local -r loop=$1
+  local -r mount_dir="$WORK_DIR/mnt-elsewhere" ready="$WORK_DIR/mounted-elsewhere"
+  mkdir -p "$mount_dir"
+  # shellcheck disable=SC2016  # $0, $1, $2 belong to the inner shell
+  unshare --mount --propagation private bash -c \
+    'mount -o ro "$0" "$1" && touch "$2" && exec sleep infinity' \
+    "${loop}p1" "$mount_dir" "$ready" &
+  local -r holder=$!
+  timeout "$MOUNT_TIMEOUT_SECONDS" bash -c 'until [[ -e $0 ]]; do sleep 0.1; done' "$ready"
+  local status=0
+  { ! findmnt "$mount_dir" > /dev/null && refuses "$PERSIST" --no-encrypt "$loop"; } \
+    || status=$?
+  kill "$holder"
+  wait "$holder" 2> /dev/null || true
+  return "$status"
+}
+
+# test_provisioning ISO PLAIN_STICK -> TAP lines; leaves PLAIN_STICK with an
+# unencrypted persistence volume for the boot tests.
+test_provisioning() {
+  local -r iso=$1 plain_stick=$2
+  local -r encrypted_stick="$WORK_DIR/encrypted.img" busy_stick="$WORK_DIR/busy.img"
+  local loop failed=0
+
+  new_stick "$iso" "$plain_stick"
+  loop="$(attach "$plain_stick")"
+  check 'provision: refused while a partition is mounted' \
+    refused_while_mounted "$loop" || failed=1
+  check 'provision: creates an unencrypted volume, silently' \
+    creates_plain_volume_silently "$loop" || failed=1
+  check 'provision: the volume has the label and persistence.conf' \
+    has_persistence_conf "$loop$PERSISTENCE_PARTITION_SUFFIX" || failed=1
+  check 'provision: a second run is refused' \
+    refuses "$PERSIST" --no-encrypt "$loop" || failed=1
+  losetup --detach "$loop"
+  check 'provision: the image area is unchanged' \
+    image_area_unchanged "$iso" "$plain_stick" || failed=1
+
+  new_stick "$iso" "$encrypted_stick"
+  loop="$(attach "$encrypted_stick")"
+  check 'provision: creates an encrypted volume from a passphrase on stdin' \
+    creates_encrypted_volume "$loop" || failed=1
+  check 'provision: the encrypted volume opens with the passphrase as typed' \
+    opens_as_typed "$loop$PERSISTENCE_PARTITION_SUFFIX" || failed=1
+  check 'provision: a second run on an encrypted stick is refused' \
+    refuses "$PERSIST" --no-encrypt "$loop" || failed=1
+  losetup --detach "$loop"
+
+  new_stick "$iso" "$busy_stick"
+  loop="$(attach "$busy_stick")"
+  check 'flash: a device that is not removable is refused and left untouched' \
+    flash_refuses_untouched "$iso" "$loop" "$busy_stick" 'not a removable device' || failed=1
+  check 'flash: an image without its checksum file is refused' \
+    flash_refuses_untouched "$(unverified_copy "$iso")" "$loop" "$busy_stick" 'checksum' || failed=1
+  check 'provision: refused while mounted in another mount namespace' \
+    refused_while_mounted_elsewhere "$loop" || failed=1
+  losetup --detach "$loop"
+
+  return "$failed"
+}
+
+# run_scenario PROVISIONED_STICK NAME FIRMWARE SECUREBOOT CODE VARS -> TAP line.
+run_scenario() {
+  local -r provisioned=$1 name=$2 firmware=$3 secureboot=$4 code=$5 vars=$6
+  local -r stick="$WORK_DIR/$name.stick.img"
+  local -r first_log="$WORK_DIR/$name.boot1.serial.log"
+  local -r second_log="$WORK_DIR/$name.boot2.serial.log"
+  local -r boot_line="$PANICOS_MARK_BOOT firmware=$firmware secureboot=$secureboot"
+  local -r desktop_line="$PANICOS_MARK_DESKTOP running=1 pkexec=1"
+  cp --sparse=always "$provisioned" "$stick"
+  local -a machine
+  mapfile -t machine < <(
+    usb_stick_args "$stick" "$WRITABLE" "$REMOVABLE"
+    firmware_args "$code" "$vars" "$secureboot" "$WORK_DIR/$name.vars.fd"
+  )
+  readonly machine
+  local status=0
+  {
+    boot "$first_log" "${machine[@]}" && serial_has "$first_log" \
+      "$boot_line" "$PANICOS_MARK_PERSISTENCE state=$PANICOS_PERSISTENCE_ACTIVE boots=1" \
+      "$desktop_line" "$PANICOS_MARK_PASS" \
+      && boot "$second_log" "${machine[@]}" && serial_has "$second_log" \
+        "$boot_line" "$PANICOS_MARK_PERSISTENCE state=$PANICOS_PERSISTENCE_ACTIVE boots=2" \
+        "$desktop_line" "$PANICOS_MARK_PASS"
+  } || status=$?
+  rm -f "$stick"
+  report "state survives a reboot ($name)" "$status" "$first_log" "$second_log"
+}
+
+main() {
+  [[ $# -eq 1 ]] || {
+    printf 'usage: persistence-test ISO\n' >&2
+    exit "$EX_USAGE"
+  }
+  local -r iso=$1
+  require_iso_and_kvm "$iso"
+
+  WORK_DIR="$(mktemp -d)"
+  readonly WORK_DIR
+  : > "$WORK_DIR/loops"
+  trap 'detach_all_attached; rm -rf "$WORK_DIR"' EXIT
+
+  local -r provisioned="$WORK_DIR/provisioned.img"
+  local failed=0
+  test_provisioning "$iso" "$provisioned" || failed=1
+  for_each_scenario run_scenario "$provisioned" || failed=1
+  exit "$failed"
+}
+
+main "$@"

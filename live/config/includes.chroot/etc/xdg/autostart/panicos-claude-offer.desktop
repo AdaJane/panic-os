@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+[Desktop Entry]
+Type=Application
+Name=PanicOS Claude Code offer
+Comment=Offers once, on a persistent stick, to download Claude Code
+# Silent unless an offer is due: see panicos-claude-offer.
+Exec=sh -c 'panicos-claude-offer --due && exec xfce4-terminal --title="PanicOS: Claude Code" --command=panicos-claude-offer'
+NoDisplay=true

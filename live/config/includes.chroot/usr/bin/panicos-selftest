@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# panicos-selftest — prove every bundled tool is present and runnable.
+#
+# usage: panicos-selftest [MANIFEST]
+#
+# Reads:  the tool manifest (default: the one installed with the image).
+# Emits:  nothing on success. One line per failed tool on stderr.
+# Exit:   0   every binary is on PATH and every smoke command exited 0
+#         1   at least one tool failed
+#         65  the manifest is malformed (a build bug, not a tool failure)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly MANIFEST_AWK="$SCRIPT_DIR/../lib/panicos/manifest.awk"
+readonly DEFAULT_MANIFEST="$SCRIPT_DIR/../share/panicos/tools.tsv"
+readonly EX_TOOL_FAILED=1
+
+# check_tool PACKAGE BINARY SMOKE -> one failure line on stdout, or nothing.
+check_tool() {
+  local -r package=$1 binary=$2 smoke=$3
+  if ! command -v -- "$binary" > /dev/null; then
+    printf '%s: %s is not on PATH\n' "$package" "$binary"
+  elif [[ -n $smoke ]] && ! bash -c "$smoke" < /dev/null > /dev/null 2>&1; then
+    printf '%s: smoke command failed: %s\n' "$package" "$smoke"
+  fi
+}
+
+# check_tools -> failure lines for every canonical manifest row on stdin.
+check_tools() {
+  local package binary smoke
+  while IFS=$'\t' read -r package binary smoke; do
+    check_tool "$package" "$binary" "$smoke"
+  done
+}
+
+main() {
+  local -r manifest=${1:-$DEFAULT_MANIFEST}
+  local rows failures
+  # Parse fully before checking anything, so a malformed manifest stops here
+  # with the parser's exit status instead of yielding a partial verdict.
+  rows="$(awk -f "$MANIFEST_AWK" -- "$manifest")"
+  failures="$(check_tools <<< "$rows")"
+  readonly rows failures
+  if [[ -n $failures ]]; then
+    printf '%s\n' "$failures" >&2
+    exit "$EX_TOOL_FAILED"
+  fi
+}
+
+main "$@"

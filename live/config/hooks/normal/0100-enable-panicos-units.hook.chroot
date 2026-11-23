@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Enable the systemd units shipped in includes.chroot.
+
+set -eu
+
+systemctl enable panicos-selftest.service

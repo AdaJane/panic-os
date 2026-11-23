@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# build-iso — build the PanicOS ISO with live-build.
+#
+# Runs as root inside the build container (see Makefile, `make iso`).
+#
+# Environment (all required):
+#   PANICOS_VERSION     version string for the output file name
+#   PANICOS_WORK        live-build working directory; its cache/ survives runs
+#   HOST_UID, HOST_GID  owner to give the files written to out/
+# Environment (optional):
+#   PANICOS_HOME_URL    where this checkout is published; recorded in the
+#                       image's os-release as its home and bug-report address
+#
+# Writes to out/:
+#   panicos-<version>-amd64.iso
+#   panicos-<version>-amd64.iso.sha256
+#   panicos-<version>-amd64.packages    every package and version in the image
+#
+# Fails, publishing nothing, if the manifest is malformed, live-build fails,
+# or the ISO exceeds the size budget.
+
+set -euo pipefail
+
+: "${PANICOS_VERSION:?}" "${PANICOS_WORK:?}" "${HOST_UID:?}" "${HOST_GID:?}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly REPO_ROOT="$SCRIPT_DIR/.."
+readonly LIVE_TREE="$REPO_ROOT/live"
+readonly MANIFEST="$REPO_ROOT/manifest/tools.tsv"
+readonly BOOT_ENTRIES="$REPO_ROOT/manifest/boot-entries.tsv"
+readonly OUT_DIR="$REPO_ROOT/out"
+readonly STAGED_CONFIG="$PANICOS_WORK/config"
+readonly STAGED_KEYRINGS="$PANICOS_WORK/keyrings"
+readonly IMAGE_KEYRING_DIR=/etc/apt/keyrings
+
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+source "$LIVE_TREE/config/includes.chroot/usr/lib/panicos/constants.sh"
+
+# Must agree with IMAGE_NAME and ARCHITECTURE in live/auto/config.
+readonly LB_ISO="$PANICOS_WORK/panicos-amd64.hybrid.iso"
+readonly LB_PACKAGES="$PANICOS_WORK/panicos-amd64.packages"
+readonly RELEASE_NAME="panicos-$PANICOS_VERSION-amd64"
+
+# The quality bar from the plan: fail the build rather than ship a fat image.
+readonly ISO_MAX_BYTES=1500000000
+
+# Replace the staged configuration with the repository's, leaving live-build's
+# cache/ in place. Files are staged root-owned: includes.chroot is copied into
+# the image verbatim, and nothing under /usr may belong to the live user.
+stage_config() {
+  rm -rf "$PANICOS_WORK/auto" "$PANICOS_WORK/config" "$STAGED_KEYRINGS"
+  cp --recursive --preserve=mode,timestamps,links "$LIVE_TREE/." "$PANICOS_WORK/"
+}
+
+# live-build caches the bootstrapped base system and reuses it without
+# checking that the options it was made with still hold. A change to
+# auto/config (say, to --debootstrap-options) would otherwise be silently
+# ignored, so the cached bootstrap is tied to the file's checksum.
+drop_stale_bootstrap_cache() {
+  local -r fingerprint_file="$PANICOS_WORK/.auto-config.sha256"
+  local -r current="$(sha256sum < "$LIVE_TREE/auto/config")"
+  if [[ ! -f $fingerprint_file || "$(< "$fingerprint_file")" != "$current" ]]; then
+    rm -rf "$PANICOS_WORK/cache/bootstrap"
+    printf '%s\n' "$current" > "$fingerprint_file"
+  fi
+}
+
+# Derive the package list and the in-image copy from the tool manifest.
+generate_from_manifest() {
+  mkdir -p "$STAGED_CONFIG/package-lists"
+  "$SCRIPT_DIR/gen-package-list" < "$MANIFEST" \
+    > "$STAGED_CONFIG/package-lists/tools.list.chroot"
+  install -D --mode=0644 "$MANIFEST" \
+    "$STAGED_CONFIG/includes.chroot/usr/share/panicos/tools.tsv"
+}
+
+# Derive both bootloaders' menus from the one boot-entry table. live-build
+# lays these files over its own templates.
+generate_boot_menus() {
+  mkdir -p "$STAGED_CONFIG/bootloaders/grub-pc" "$STAGED_CONFIG/bootloaders/syslinux_common"
+  "$SCRIPT_DIR/gen-boot-menu" grub < "$BOOT_ENTRIES" \
+    > "$STAGED_CONFIG/bootloaders/grub-pc/grub.cfg"
+  "$SCRIPT_DIR/gen-boot-menu" syslinux < "$BOOT_ENTRIES" \
+    > "$STAGED_CONFIG/bootloaders/syslinux_common/live.cfg.in"
+}
+
+# Write the image's os-release: its name, its version, and where it comes
+# from. Installed over Debian's by the 0300 hook; read by panicos-status.
+write_os_release() {
+  local -r os_release="$STAGED_CONFIG/includes.chroot$PANICOS_OS_RELEASE_SOURCE"
+  install -d "$(dirname "$os_release")"
+  cat > "$os_release" << END
+PRETTY_NAME="PanicOS $PANICOS_VERSION (based on Debian $PANICOS_DEBIAN_CODENAME)"
+NAME="PanicOS"
+ID=$PANICOS_OS_ID
+ID_LIKE=debian
+VERSION="$PANICOS_VERSION"
+VERSION_ID="$PANICOS_VERSION"
+VERSION_CODENAME=$PANICOS_DEBIAN_CODENAME
+IMAGE_ID=live
+END
+  # Only a build from a published checkout knows where its home is.
+  [[ -z ${PANICOS_HOME_URL:-} ]] || cat >> "$os_release" << END
+HOME_URL="$PANICOS_HOME_URL"
+BUG_REPORT_URL="$PANICOS_HOME_URL/issues"
+END
+}
+
+# A failed build must not leave an earlier ISO of the same name behind to be
+# tested or flashed by mistake.
+remove_previous_release() {
+  rm -f "$OUT_DIR/$RELEASE_NAME".*
+}
+
+# Give each third-party archive its key before live-build first runs apt.
+# live-build's own mechanism (config/archives/*.key) would put the keys in
+# apt's global keyring, trusting them for every archive, Debian's included;
+# here each is only reachable through the signed-by= of its own sources line.
+#
+# The keys go into the bootstrapped system and into live-build's cached copy
+# of it: the installer and binary stages run apt in a working chroot made
+# from that copy, with the same archives configured.
+install_archive_keys() {
+  local system_root
+  for system_root in "$PANICOS_WORK/chroot" "$PANICOS_WORK/cache/bootstrap"; do
+    install -d "$system_root$IMAGE_KEYRING_DIR"
+    install --mode=0644 "$STAGED_KEYRINGS"/*.asc "$system_root$IMAGE_KEYRING_DIR/"
+  done
+}
+
+# The stages of `lb build`, run one by one so that the archive keys can go
+# in between bootstrap and chroot. The source stage is left out: PanicOS
+# builds no source image.
+run_live_build() (
+  cd "$PANICOS_WORK"
+  lb clean
+  lb config
+  lb bootstrap
+  install_archive_keys
+  lb chroot
+  lb installer
+  lb binary
+)
+
+check_size_budget() {
+  local -r size_bytes="$(stat --format=%s "$LB_ISO")"
+  if ((size_bytes > ISO_MAX_BYTES)); then
+    printf 'build-iso: ISO is %d bytes, over the %d byte budget\n' \
+      "$size_bytes" "$ISO_MAX_BYTES" >&2
+    exit 1
+  fi
+}
+
+publish() {
+  install -d --owner="$HOST_UID" --group="$HOST_GID" "$OUT_DIR"
+  install --mode=0644 "$LB_ISO" "$OUT_DIR/$RELEASE_NAME.iso"
+  install --mode=0644 "$LB_PACKAGES" "$OUT_DIR/$RELEASE_NAME.packages"
+  (cd "$OUT_DIR" && sha256sum "$RELEASE_NAME.iso" > "$RELEASE_NAME.iso.sha256")
+  chown "$HOST_UID:$HOST_GID" "$OUT_DIR/$RELEASE_NAME".*
+}
+
+remove_previous_release
+stage_config
+drop_stale_bootstrap_cache
+generate_from_manifest
+generate_boot_menus
+write_os_release
+run_live_build
+check_size_budget
+publish

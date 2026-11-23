@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# boot-test — boot the pristine ISO as a read-only USB stick under every
+# firmware scenario and assert that the in-image self-test passes.
+#
+# usage: boot-test ISO
+#
+# This is the stick as another flashing tool would leave it: no persistence
+# volume. The guest must say so (state=missing).
+#
+# Runs inside the build container with /dev/kvm (see Makefile, `make test-vm`).
+#
+# Emits:  one TAP line per scenario on stdout; the serial log of each failed
+#         scenario on stderr.
+# Exit:   0 if every scenario passed, 1 otherwise.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+# shellcheck source=tests/vm/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+# run_scenario ISO NAME FIRMWARE SECUREBOOT OVMF_CODE OVMF_VARS -> TAP line.
+run_scenario() {
+  local -r iso=$1 name=$2 firmware=$3 secureboot=$4 code=$5 vars=$6
+  local -r serial_log="$WORK_DIR/$name.serial.log"
+  local -a machine
+  mapfile -t machine < <(
+    usb_stick_args "$iso" "$READ_ONLY" "$REMOVABLE"
+    firmware_args "$code" "$vars" "$secureboot" "$WORK_DIR/$name.vars.fd"
+  )
+  readonly machine
+  local status=0
+  {
+    boot "$serial_log" "${machine[@]}" && serial_has "$serial_log" \
+      "$PANICOS_MARK_BOOT firmware=$firmware secureboot=$secureboot" \
+      "$PANICOS_MARK_IDENTITY id=$PANICOS_OS_ID" \
+      "$PANICOS_MARK_PERSISTENCE state=$PANICOS_PERSISTENCE_MISSING boots=1" \
+      "$PANICOS_MARK_DESKTOP running=1 pkexec=1" \
+      "$PANICOS_MARK_PASS"
+  } || status=$?
+  report "boots and passes the self-test ($name)" "$status" "$serial_log"
+}
+
+main() {
+  [[ $# -eq 1 ]] || {
+    printf 'usage: boot-test ISO\n' >&2
+    exit "$EX_USAGE"
+  }
+  local -r iso=$1
+  require_iso_and_kvm "$iso"
+
+  WORK_DIR="$(mktemp -d)"
+  readonly WORK_DIR
+  trap 'rm -rf "$WORK_DIR"' EXIT
+
+  for_each_scenario run_scenario "$iso"
+}
+
+main "$@"

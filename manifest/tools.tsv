@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: MIT
+# PanicOS tool manifest: the single source of truth for bundled tools.
+#
+# One row per binary, TAB-separated:
+#
+#   package <TAB> binary <TAB> smoke-command (optional)
+#
+# The build installs every package named here. Inside the image,
+# panicos-selftest checks that each binary is on PATH and, when a smoke command
+# is given, that it exits 0. Packages that ship no binary (firmware, kernel)
+# belong in live/config/package-lists/base.list.chroot instead.
+#
+# Smoke commands run under `bash -c` with no terminal and no stdin. Prefer one
+# that makes the tool do real work over one that only prints a version.
+
+# --- Partitioning ------------------------------------------------------------
+gparted	gparted
+parted	parted	parted --version
+gdisk	gdisk
+gdisk	sgdisk	sgdisk --version
+testdisk	testdisk	testdisk /version
+testdisk	photorec	photorec /version
+
+# --- Imaging and cloning -----------------------------------------------------
+gddrescue	ddrescue	ddrescue --version
+gddrescue	ddrescuelog	ddrescuelog --version
+ddrutility	ddru_ntfsbitmap
+partclone	partclone.dd
+partclone	partclone.ntfs
+fsarchiver	fsarchiver	fsarchiver --version
+dc3dd	dc3dd	dc3dd --version
+dcfldd	dcfldd	dcfldd --version
+safecopy	safecopy
+pv	pv	pv --version
+
+# --- File carving and undelete -----------------------------------------------
+foremost	foremost	foremost -V
+scalpel	scalpel
+sleuthkit	fls	fls -V
+sleuthkit	mmls	mmls -V
+extundelete	extundelete	extundelete --version
+ext4magic	ext4magic
+
+# --- Disk and hardware health ------------------------------------------------
+smartmontools	smartctl	smartctl --version
+nvme-cli	nvme	nvme version
+hdparm	hdparm	hdparm -V
+sdparm	sdparm	sdparm --version
+lshw	lshw	lshw -version
+dmidecode	dmidecode	dmidecode --version
+pciutils	lspci	lspci --version
+usbutils	lsusb	lsusb --version
+memtester	memtester
+nwipe	nwipe	nwipe --version
+
+# --- Filesystems -------------------------------------------------------------
+ntfs-3g	ntfs-3g
+ntfs-3g	ntfsfix
+ntfs-3g	ntfsundelete
+exfatprogs	fsck.exfat
+exfatprogs	mkfs.exfat
+dosfstools	fsck.fat
+btrfs-progs	btrfs	btrfs --version
+xfsprogs	xfs_repair	xfs_repair -V
+f2fs-tools	fsck.f2fs	fsck.f2fs -V
+hfsprogs	fsck.hfsplus
+libfsapfs-utils	fsapfsinfo	fsapfsinfo -V
+apfsprogs	apfsck
+e2fsprogs	mkfs.ext4	mkfs.ext4 -V
+e2fsprogs	debugfs	debugfs -V
+
+# --- Volumes, encryption, boot -----------------------------------------------
+lvm2	lvm	lvm version
+thin-provisioning-tools	thin_check	thin_check --version
+mdadm	mdadm	mdadm --version
+cryptsetup	cryptsetup	cryptsetup --version
+dislocker	dislocker-metadata
+chntpw	chntpw
+efibootmgr	efibootmgr	efibootmgr --version
+fdisk	sfdisk	sfdisk --version
+util-linux	lsblk	lsblk --version
+
+# --- Getting recovered data off the machine ----------------------------------
+rsync	rsync	rsync --version
+openssh-client	ssh	ssh -V
+sshfs	sshfs	sshfs --version
+cifs-utils	mount.cifs
+nfs-common	mount.nfs	mount.nfs -V
+curl	curl	curl --version
+wget	wget	wget --version
+
+# --- Development toolchain ---------------------------------------------------
+gcc	gcc	d=$(mktemp -d) && printf 'int main(void){return 0;}' | gcc -x c -o "$d/smoke" - && "$d/smoke"; s=$?; rm -rf "$d"; exit $s
+g++	g++	d=$(mktemp -d) && printf 'int main(){return 0;}' | g++ -x c++ -o "$d/smoke" - && "$d/smoke"; s=$?; rm -rf "$d"; exit $s
+make	make	make --version
+gdb	gdb	gdb --version
+git	git	git --version
+python3	python3	d=$(mktemp -d) && python3 -m venv "$d/venv" && "$d/venv/bin/pip" --version; s=$?; rm -rf "$d"; exit $s
+python3-pip	pip3	pip3 --version
+rustc	rustc	d=$(mktemp -d) && printf 'fn main() {}' > "$d/smoke.rs" && rustc -o "$d/smoke" "$d/smoke.rs" && "$d/smoke"; s=$?; rm -rf "$d"; exit $s
+cargo	cargo	cargo --version
+
+# --- Shell comforts ----------------------------------------------------------
+tmux	tmux	tmux -V
+vim-tiny	vim.tiny	vim.tiny --version
+less	less	less --version
+htop	htop	htop --version
+mc	mc	TERM=dumb mc --version
+jq	jq	jq --version
+file	file	file --version
+xxd	xxd	xxd -v
+psmisc	killall	killall --version
+patch	patch	patch --version
+unzip	unzip	unzip -v
+zip	zip	zip -v
+7zip	7z
+zstd	zstd	zstd --version
+
+# --- Network -----------------------------------------------------------------
+network-manager	nmcli	nmcli --version
+network-manager	nmtui
+wpasupplicant	wpa_supplicant	wpa_supplicant -v
+iproute2	ip	ip -V
+iputils-ping	ping	ping -V
+
+# --- Desktop -----------------------------------------------------------------
+xinit	startx
+xfce4-session	startxfce4
+xfce4-terminal	xfce4-terminal
+thunar	thunar
+
+# --- Browser -----------------------------------------------------------------
+# Mozilla's own build, from Mozilla's apt archive (live/config/archives).
+firefox	firefox	firefox --version
+# Lets other programs (Claude Code's sign-in among them) open links in it.
+xdg-utils	xdg-open	xdg-open --version

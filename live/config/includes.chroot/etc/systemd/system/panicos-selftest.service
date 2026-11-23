@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# Runs the self-test for the VM test harness, then powers the machine off.
+#
+# Inert on real hardware: it only starts when the harness passes the
+# panicos.selftest credential (QEMU -smbios type=11). The credential name is
+# defined in /usr/lib/panicos/constants.sh.
+
+[Unit]
+Description=PanicOS self-test report for the VM test harness
+ConditionCredential=panicos.selftest
+SuccessAction=poweroff
+FailureAction=poweroff
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/panicos/selftest-report
+StandardOutput=file:/dev/ttyS0
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

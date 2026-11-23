@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Replaces live-build's hook of the same name, which deletes
+# /etc/mdadm/mdadm.conf because a generated one would describe the build
+# host's arrays. PanicOS ships its own (includes.chroot/etc/mdadm/mdadm.conf),
+# and that file is what stops client RAID arrays from being assembled at
+# boot, so it has to survive. This hook only checks that it did.
+
+set -eu
+
+grep --quiet --line-regexp 'AUTO -all' /etc/mdadm/mdadm.conf

@@ -1,0 +1,128 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# panicos-flash — write a PanicOS image to a USB stick and give it a
+# persistence volume.
+#
+# usage: panicos-flash [--no-encrypt] [--yes] ISO DEVICE
+#
+# EVERYTHING ON DEVICE IS DESTROYED.
+#
+# Pre:    Run as root. ISO has its checksum file (ISO.sha256) beside it and
+#         matches it. DEVICE is a whole, removable disk with nothing mounted,
+#         large enough for the image plus a 1 GiB persistence volume.
+#         Anything else is refused, with every objection listed, before a
+#         byte is written.
+# Asks:   to retype DEVICE as confirmation, unless --yes is given. Without a
+#         terminal, --yes is required.
+# Post:   DEVICE holds the image, bootable under BIOS and UEFI, followed by a
+#         persistence volume (see panicos-persist) — encrypted unless
+#         --no-encrypt is given.
+# Passphrase (when encrypting): asked for by panicos-persist once the image
+#         has been written.
+# Emits:  what is about to be erased, the confirmation prompt, and write
+#         progress, all on stderr and only when stderr is a terminal.
+# Exit:   0 done; 1 refused or failed (reason on stderr); 64 usage error.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly LIB_DIR="$SCRIPT_DIR/../lib/panicos"
+readonly PROGRAM=panicos-flash
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+source "$LIB_DIR/constants.sh"
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/device.sh
+source "$LIB_DIR/device.sh"
+
+readonly EX_USAGE=64
+readonly CHECKSUM_SUFFIX=.sha256
+readonly WRITE_BLOCK_SIZE=4M
+
+usage() {
+  printf 'usage: %s [--no-encrypt] [--yes] ISO DEVICE\n' "$PROGRAM" >&2
+  exit "$EX_USAGE"
+}
+
+# verify_checksum ISO -> returns only if ISO matches the checksum beside it.
+verify_checksum() {
+  local -r iso=$1
+  local -r checksum_file="$iso$CHECKSUM_SUFFIX"
+  [[ -r $checksum_file ]] || die "no checksum file $checksum_file; refusing to flash an unverified image"
+  (cd "$(dirname "$iso")" && sha256sum --check --status "$(basename "$checksum_file")") \
+    || die "$iso does not match $checksum_file"
+}
+
+# target_objections DEVICE IMAGE_BYTES -> one line per reason DEVICE must not
+# be overwritten.
+target_objections() {
+  local -r device=$1 image_bytes=$2
+  device_facts "$device" \
+    | device_jq \
+      --argjson image_bytes "$image_bytes" \
+      --argjson min_persistence_bytes "$PANICOS_MIN_PERSISTENCE_BYTES" \
+      'include "device"; flash_objections($image_bytes; $min_persistence_bytes)[]'
+}
+
+# confirm DEVICE -> returns only if the operator retypes DEVICE.
+confirm() {
+  local -r device=$1
+  [[ -t 0 && -t 2 ]] || die 'not a terminal: pass --yes to erase without confirmation'
+  local answer
+  {
+    printf 'About to ERASE this device and everything on it:\n\n'
+    lsblk --output NAME,SIZE,TYPE,TRAN,VENDOR,MODEL,LABEL "$device"
+    printf '\nType %s to continue: ' "$device"
+  } >&2
+  read -r answer
+  [[ $answer == "$device" ]] || die 'not confirmed; nothing was written'
+}
+
+write_image() {
+  local -r iso=$1 device=$2
+  local progress=none
+  [[ ! -t 2 ]] || progress=progress
+  readonly progress
+  dd if="$iso" of="$device" bs="$WRITE_BLOCK_SIZE" oflag=direct conv=fsync \
+    status="$progress" || die "writing $iso to $device failed"
+  sync
+  # Have the kernel read the image's partition table, then wait for its
+  # partitions to appear before anything looks at them.
+  quietly blockdev --rereadpt "$device"
+  local node
+  while read -r node; do
+    wait_for_block_device "$node"
+  done < <(sfdisk --json "$device" | device_jq '.partitiontable.partitions[].node')
+}
+
+main() {
+  local encrypt=true assume_yes=false
+  while [[ ${1:-} == -* ]]; do
+    case $1 in
+      --no-encrypt) encrypt=false ;;
+      --yes) assume_yes=true ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  readonly encrypt assume_yes
+  [[ $# -eq 2 ]] || usage
+  local -r iso=$1 device=$2
+
+  [[ $EUID -eq 0 ]] || die 'must be run as root'
+  [[ -r $iso ]] || die "cannot read $iso"
+  [[ -b $device ]] || die "$device is not a block device"
+  verify_checksum "$iso"
+  refuse_if "$device" "$(target_objections "$device" "$(stat --format=%s "$iso")")"
+  refuse_if "$device" "$(in_use_objection "$device")"
+  [[ $assume_yes == true ]] || confirm "$device"
+
+  write_image "$iso" "$device"
+
+  local -a persist_options=()
+  [[ $encrypt == true ]] || persist_options+=(--no-encrypt)
+  readonly persist_options
+  "$SCRIPT_DIR/panicos-persist" "${persist_options[@]}" "$device"
+}
+
+main "$@"

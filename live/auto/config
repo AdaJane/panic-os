@@ -1,0 +1,70 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# The one place PanicOS's live-build options are set. `lb config` runs this.
+
+set -eu
+
+readonly ARCHITECTURE=amd64
+# contrib and non-free carry hfsprogs; non-free-firmware carries Wi-Fi and
+# GPU firmware.
+readonly ARCHIVE_AREAS="main contrib non-free non-free-firmware"
+readonly IMAGE_NAME=panicos
+readonly ISO_APPLICATION=PanicOS
+# PANICOS_HOME_URL is passed in by scripts/build-iso when the checkout has a
+# published home; the ISO 9660 field holds at most 128 characters.
+readonly ISO_PUBLISHER="The PanicOS contributors${PANICOS_HOME_URL:+; ${PANICOS_HOME_URL}}"
+# live-build runs `apt-get update` over config/archives before it installs any
+# package. The Claude Code archive is HTTPS, which apt can only verify once
+# ca-certificates is present, so it has to arrive with the bootstrap.
+readonly DEBOOTSTRAP_OPTIONS="--include=ca-certificates"
+# --backports true only adds the trixie-backports archive. Nothing comes from
+# it unless pinned: see config/archives/rust-backports.pref.
+
+# live-build runs this from the top of its working tree.
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+. config/includes.chroot/usr/lib/panicos/constants.sh
+
+# Persistence is on by default, and restricted so that looking for it can
+# never touch a client disk:
+#   persistence-storage=filesystem   match volume labels only; live-boot's
+#                                    default also mounts every filesystem it
+#                                    finds to look for persistence image files
+#   persistence-label=...            our own label, not live-boot's default
+#   persistence-encryption=none,lukslabel
+#                                    plain volumes, or LUKS containers whose
+#                                    header label is "persistence"; plain
+#                                    "luks" would ask for the passphrase of
+#                                    every encrypted disk in the machine
+readonly PERSISTENCE_PARAMETERS="persistence persistence-storage=filesystem persistence-label=${PANICOS_PERSISTENCE_LABEL} persistence-encryption=none,lukslabel"
+# live-config creates this user at boot, with passwordless sudo, and logs it
+# in on tty1.
+readonly IDENTITY_PARAMETERS="hostname=panicos username=panic user-fullname=PanicOS"
+# The one device the initramfs may mount to find the live image. Without this
+# it would mount filesystems on the machine's own disks while searching: see
+# includes.chroot/usr/lib/live/boot/9995-panicos-strict-medium.sh.
+readonly MEDIUM_PARAMETERS="live-media=/dev/disk/by-label/${PANICOS_ISO_LABEL}"
+# No "quiet splash": on a recovery stick the boot messages are the diagnostics.
+readonly BOOT_PARAMETERS="boot=live components ${MEDIUM_PARAMETERS} ${IDENTITY_PARAMETERS} ${PERSISTENCE_PARAMETERS}"
+
+lb config noauto \
+	--distribution "${PANICOS_DEBIAN_CODENAME}" \
+	--architecture "${ARCHITECTURE}" \
+	--archive-areas "${ARCHIVE_AREAS}" \
+	--apt-recommends false \
+	--backports true \
+	--debootstrap-options "${DEBOOTSTRAP_OPTIONS}" \
+	--binary-image iso-hybrid \
+	--bootloaders "syslinux,grub-efi" \
+	--uefi-secure-boot enable \
+	--bootappend-live "${BOOT_PARAMETERS}" \
+	--bootappend-live-failsafe none \
+	--debian-installer none \
+	--memtest memtest86+ \
+	--firmware-chroot false \
+	--firmware-binary false \
+	--image-name "${IMAGE_NAME}" \
+	--iso-application "${ISO_APPLICATION}" \
+	--iso-publisher "${ISO_PUBLISHER}" \
+	--iso-volume "${PANICOS_ISO_LABEL}" \
+	"${@}"

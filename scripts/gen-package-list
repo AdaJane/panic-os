@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# gen-package-list — derive the live-build package list from the tool manifest.
+#
+# Reads:  the tool manifest on stdin (format: see manifest.awk)
+# Emits:  one Debian package name per line, sorted and unique
+# Fails:  exit 65 with nothing on stdout if the manifest is malformed
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly MANIFEST_AWK="$SCRIPT_DIR/../live/config/includes.chroot/usr/lib/panicos/manifest.awk"
+readonly PACKAGE_COLUMN=1
+
+awk -f "$MANIFEST_AWK" | cut -f"$PACKAGE_COLUMN" | LC_ALL=C sort -u

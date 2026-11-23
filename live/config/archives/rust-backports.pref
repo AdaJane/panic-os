@@ -1,0 +1,8 @@
+Explanation: SPDX-License-Identifier: MIT
+Explanation: Take the Rust toolchain from trixie-backports (1.96 at the time
+Explanation: of writing) instead of trixie's 1.85, which is too old for many
+Explanation: current crates. Everything else stays on stable: backports are
+Explanation: otherwise only used when a package is asked for explicitly.
+Package: src:rustc
+Pin: release n=trixie-backports
+Pin-Priority: 500

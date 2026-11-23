@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Follow `source` directives into other files of this repository.
+external-sources=true
+
+# SC2016 "expressions don't expand in single quotes": jq programs are passed
+# in single quotes on purpose; their $names belong to jq, not the shell.
+disable=SC2016
+
+# SC2317 "command appears to be unreachable": helpers are called indirectly
+# (check NAME FUNCTION..., for_each_scenario FUNCTION...), which shellcheck
+# cannot follow.
+disable=SC2317

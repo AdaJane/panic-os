@@ -1,0 +1,6 @@
+Explanation: SPDX-License-Identifier: MIT
+Explanation: Prefer Mozilla's own packages over anything of the same name in
+Explanation: Debian (where "firefox" does not exist in stable, but may one day).
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000

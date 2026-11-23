@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+[Desktop Entry]
+Type=Application
+Name=PanicOS persistence check
+Comment=Opens a terminal with a warning if this stick is not keeping state
+# Silent when all is well: the window only appears if panicos-status fails.
+Exec=sh -c 'panicos-status > /dev/null || exec xfce4-terminal --hold --title="PanicOS: persistence is missing" --command=panicos-status'
+NoDisplay=true

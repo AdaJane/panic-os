@@ -1,0 +1,90 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# panicos-claude-offer — offer, once, to install Claude Code.
+#
+# usage: panicos-claude-offer          ask on this terminal
+#        panicos-claude-offer --due    say whether an offer is due
+#
+# Run at desktop login (see /etc/xdg/autostart/panicos-claude-offer.desktop),
+# which opens a terminal for it only when --due succeeds.
+#
+# --due exits 0 if the offer should be shown: persistence is active, Claude
+# Code is not installed, and the operator has not declined. It exits 1 if
+# not, and 2 if it cannot tell because there is no home directory to hold
+# the record of a refusal.
+#
+# Asking: "yes" runs panicos-install-claude. "No" is remembered, and the
+# offer never returns. A failed install is not remembered, so the offer
+# comes back at the next login, by when the network may be up.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly LIB_DIR="$SCRIPT_DIR/../lib/panicos"
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/constants.sh
+source "$LIB_DIR/constants.sh"
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/persistence.sh
+source "$LIB_DIR/persistence.sh"
+# shellcheck source=live/config/includes.chroot/usr/lib/panicos/claude.sh
+source "$LIB_DIR/claude.sh"
+
+readonly EX_USAGE=64
+readonly EX_CANNOT_TELL=2
+
+# A refusal is recorded under the config directory; without one, nothing
+# here can be answered.
+require_config_home() {
+  [[ -n ${XDG_CONFIG_HOME:-${HOME:-}} ]] || {
+    printf 'panicos-claude-offer: neither XDG_CONFIG_HOME nor HOME is set\n' >&2
+    exit "$EX_CANNOT_TELL"
+  }
+}
+
+offer_due() {
+  claude_offer_due "$(current_persistence_state)" "$(claude_installed)" "$(claude_declined)"
+}
+
+ask() {
+  cat << 'END'
+Claude Code is not installed on this stick.
+
+Claude Code is Anthropic's AI coding assistant. It is proprietary software,
+not part of PanicOS: it is downloaded from Anthropic (about 135 MB), is
+subject to Anthropic's terms, and is used with your own Anthropic account.
+On this stick it will be kept across reboots.
+
+END
+  local answer
+  read -r -p 'Install Claude Code now? [y/N] ' answer
+  case $answer in
+    [yY] | [yY][eE][sS])
+      if "$SCRIPT_DIR/panicos-install-claude"; then
+        printf '\nInstalled. Start it with: claude\n'
+      else
+        printf '\nNot installed. Connect to a network (nmtui), then run: panicos-install-claude\n'
+      fi
+      ;;
+    *)
+      remember_claude_declined
+      printf '\nNot installed, and you will not be asked again.\nTo install it later, run: panicos-install-claude\n'
+      ;;
+  esac
+  read -r -p 'Press Enter to close. ' answer
+}
+
+case ${1:-} in
+  '')
+    require_config_home
+    ask
+    ;;
+  --due)
+    require_config_home
+    offer_due
+    ;;
+  *)
+    printf 'usage: panicos-claude-offer [--due]\n' >&2
+    exit "$EX_USAGE"
+    ;;
+esac

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Firmware scenarios the ISO must boot under. TAB-separated:
+#
+#   name  firmware  secureboot  ovmf-code  ovmf-vars
+#
+# firmware and secureboot are what the guest must report about itself, so a
+# scenario cannot pass by silently booting some other way. ovmf-code and
+# ovmf-vars are file names under /usr/share/OVMF, or "-" for SeaBIOS.
+bios	bios	0	-	-
+uefi	uefi	0	OVMF_CODE_4M.fd	OVMF_VARS_4M.fd
+secureboot	uefi	1	OVMF_CODE_4M.secboot.fd	OVMF_VARS_4M.ms.fd
